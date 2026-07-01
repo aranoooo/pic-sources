@@ -1,0 +1,90 @@
+name: Build Fewen XBS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'xs-fewen.json'
+      - '.github/workflows/build-fewen-xbs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build packed XBS
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+
+          DELTA = 0x9E3779B9
+          KEY = bytes([0xe5, 0x87, 0xbc, 0xe8, 0xa4, 0x86, 0xe6, 0xbb, 0xbf, 0xe9, 0x87, 0x91, 0xe6, 0xba, 0xa1, 0xe5])
+
+          def mx(y, z, p, e, s, k):
+              return (((z >> 5 ^ ((y << 2) & 0xffffffff)) + (y >> 3 ^ ((z << 4) & 0xffffffff))) ^ ((s ^ y) + (k[(p & 3) ^ e] ^ z))) & 0xffffffff
+
+          def bytes_to_uint32(data):
+              out = [0] * (len(data) // 4)
+              for i, b in enumerate(data):
+                  out[i >> 2] = (out[i >> 2] | (b << ((i & 3) << 3))) & 0xffffffff
+              return out
+
+          def uint32_to_bytes(v):
+              buf = bytearray(len(v) * 4)
+              for i, n in enumerate(v):
+                  n &= 0xffffffff
+                  buf[4*i] = n & 0xff
+                  buf[4*i+1] = (n >> 8) & 0xff
+                  buf[4*i+2] = (n >> 16) & 0xff
+                  buf[4*i+3] = (n >> 24) & 0xff
+              return bytes(buf)
+
+          def encrypt(data, key):
+              if len(key) != 16:
+                  raise ValueError('need 16-byte key')
+              if len(data) < 8 or len(data) % 4:
+                  raise ValueError('data length must be multiple of 4 and at least 8')
+              v = bytes_to_uint32(data)
+              k = bytes_to_uint32(key)
+              n = len(v)
+              rounds = 6 + 52 // n
+              s = 0
+              z = v[n - 1]
+              for _ in range(rounds):
+                  s = (s + DELTA) & 0xffffffff
+                  e = (s >> 2) & 3
+                  for p in range(n - 1):
+                      y = v[p + 1]
+                      v[p] = (v[p] + mx(y, z, p, e, s, k)) & 0xffffffff
+                      z = v[p]
+                  y = v[0]
+                  p = n - 1
+                  v[n - 1] = (v[n - 1] + mx(y, z, p, e, s, k)) & 0xffffffff
+                  z = v[n - 1]
+              return uint32_to_bytes(v)
+
+          src = Path('xs-fewen.json').read_bytes()
+          original_len = len(src)
+          padded_len = ((original_len + 3) // 4) * 4
+          plain = src + (b'\x00' * (padded_len - original_len)) + struct.pack('<I', original_len)
+          Path('xs-fewen.xbs').write_bytes(encrypt(plain, KEY))
+          print(f'packed xs-fewen.xbs: json={original_len} bytes, xbs={Path("xs-fewen.xbs").stat().st_size} bytes')
+          PY
+      - name: Commit packed XBS
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add xs-fewen.xbs
+          if git diff --cached --quiet; then
+            echo "No XBS changes"
+          else
+            git commit -m "Build packed Fewen XBS"
+            git push
+          fi
